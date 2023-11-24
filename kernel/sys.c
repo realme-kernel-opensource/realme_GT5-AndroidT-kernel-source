@@ -2291,6 +2291,9 @@ static int prctl_set_vma(unsigned long opt, unsigned long addr,
 	const char __user *uname;
 	struct anon_vma_name *anon_name = NULL;
 	int error;
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+	bool chp = false;
+#endif
 
 	switch (opt) {
 	case PR_SET_VMA_ANON_NAME:
@@ -2316,8 +2319,17 @@ static int prctl_set_vma(unsigned long opt, unsigned long addr,
 
 		}
 
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+		chp = handle_chp_prctl_user_addrs((const char __user *)arg,
+						addr, size);
+#endif
+
 		mmap_write_lock(mm);
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+		error = madvise_set_anon_name(mm, addr, size, anon_name, chp);
+#else
 		error = madvise_set_anon_name(mm, addr, size, anon_name);
+#endif
 		mmap_write_unlock(mm);
 		anon_vma_name_put(anon_name);
 		break;

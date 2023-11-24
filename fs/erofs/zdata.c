@@ -60,7 +60,11 @@ static int z_erofs_create_pcluster_pool(void)
 	return 0;
 }
 
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+static struct z_erofs_pcluster *z_erofs_alloc_pcluster(unsigned int nrpages, struct page *page)
+#else
 static struct z_erofs_pcluster *z_erofs_alloc_pcluster(unsigned int nrpages)
+#endif
 {
 	int i;
 
@@ -71,6 +75,15 @@ static struct z_erofs_pcluster *z_erofs_alloc_pcluster(unsigned int nrpages)
 		if (nrpages > pcs->maxpages)
 			continue;
 
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+#if EROFS_IOERROR_INJECTION
+		/* FIXME: trigger page error! */
+		if (PageCont(page) &&
+		    (page_to_pfn(page) % HPAGE_CONT_PTE_NR) < 2 &&
+		    (get_random_u32() & 1))
+			return ERR_PTR(-ENOMEM);
+#endif
+#endif
 		pcl = kmem_cache_zalloc(pcs->slab, GFP_NOFS);
 		if (!pcl)
 			return ERR_PTR(-ENOMEM);
@@ -318,6 +331,9 @@ int erofs_try_to_free_all_cached_pages(struct erofs_sb_info *sbi,
 		/* barrier is implied in the following 'unlock_page' */
 		WRITE_ONCE(pcl->compressed_pages[i], NULL);
 		detach_page_private(page);
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+		CHP_BUG_ON(PageCont(page));
+#endif
 		unlock_page(page);
 	}
 	return 0;
@@ -454,9 +470,16 @@ static int z_erofs_lookup_collection(struct z_erofs_collector *clt,
 	return 0;
 }
 
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+static int z_erofs_register_collection(struct z_erofs_collector *clt,
+				       struct inode *inode,
+				       struct erofs_map_blocks *map,
+				       struct page *page)
+#else
 static int z_erofs_register_collection(struct z_erofs_collector *clt,
 				       struct inode *inode,
 				       struct erofs_map_blocks *map)
+#endif
 {
 	struct z_erofs_pcluster *pcl;
 	struct z_erofs_collection *cl;
@@ -469,7 +492,11 @@ static int z_erofs_register_collection(struct z_erofs_collector *clt,
 	}
 
 	/* no available pcluster, let's allocate one */
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+	pcl = z_erofs_alloc_pcluster(map->m_plen >> PAGE_SHIFT, page);
+#else
 	pcl = z_erofs_alloc_pcluster(map->m_plen >> PAGE_SHIFT);
+#endif
 	if (IS_ERR(pcl))
 		return PTR_ERR(pcl);
 
@@ -519,9 +546,16 @@ err_out:
 	return err;
 }
 
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+static int z_erofs_collector_begin(struct z_erofs_collector *clt,
+				   struct inode *inode,
+				   struct erofs_map_blocks *map,
+				   struct page *page)
+#else
 static int z_erofs_collector_begin(struct z_erofs_collector *clt,
 				   struct inode *inode,
 				   struct erofs_map_blocks *map)
+#endif
 {
 	struct erofs_workgroup *grp;
 	int ret;
@@ -541,8 +575,11 @@ static int z_erofs_collector_begin(struct z_erofs_collector *clt,
 	if (grp) {
 		clt->pcl = container_of(grp, struct z_erofs_pcluster, obj);
 	} else {
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+		ret = z_erofs_register_collection(clt, inode, map, page);
+#else
 		ret = z_erofs_register_collection(clt, inode, map);
-
+#endif
 		if (!ret)
 			goto out;
 		if (ret != -EEXIST)
@@ -677,7 +714,11 @@ restart_now:
 	if (!(map->m_flags & EROFS_MAP_MAPPED))
 		goto hitted;
 
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+	err = z_erofs_collector_begin(clt, inode, map, page);
+#else
 	err = z_erofs_collector_begin(clt, inode, map);
+#endif
 	if (err)
 		goto err_out;
 
@@ -770,12 +811,9 @@ static void z_erofs_decompress_kickoff(struct z_erofs_decompressqueue *io,
 
 	/* wake up the caller thread for sync decompression */
 	if (sync) {
-		unsigned long flags;
-
-		spin_lock_irqsave(&io->u.wait.lock, flags);
 		if (!atomic_add_return(bios, &io->pending_bios))
-			wake_up_locked(&io->u.wait);
-		spin_unlock_irqrestore(&io->u.wait.lock, flags);
+			complete(&io->u.done);
+
 		return;
 	}
 
@@ -813,6 +851,9 @@ static void z_erofs_decompressqueue_endio(struct bio *bio)
 			SetPageError(page);
 
 		if (erofs_page_is_managed(EROFS_SB(q->sb), page)) {
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+			CHP_BUG_ON(PageCont(page));
+#endif
 			if (!err)
 				SetPageUptodate(page);
 			unlock_page(page);
@@ -1133,6 +1174,9 @@ repeat:
 
 		/* no need to submit io if it is already up-to-date */
 		if (PageUptodate(page)) {
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+			CHP_BUG_ON(PageCont(page));
+#endif
 			unlock_page(page);
 			page = NULL;
 		}
@@ -1147,6 +1191,9 @@ repeat:
 	DBG_BUGON(!justfound);
 
 	tocache = true;
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+	CHP_BUG_ON(PageCont(page));
+#endif
 	unlock_page(page);
 	put_page(page);
 out_allocpage:
@@ -1186,7 +1233,7 @@ jobqueue_init(struct super_block *sb,
 	} else {
 fg_out:
 		q = fgq;
-		init_waitqueue_head(&fgq->u.wait);
+		init_completion(&fgq->u.done);
 		atomic_set(&fgq->pending_bios, 0);
 	}
 	q->sb = sb;
@@ -1359,8 +1406,7 @@ static void z_erofs_runqueue(struct super_block *sb,
 		return;
 
 	/* wait until all bios are completed */
-	io_wait_event(io[JQ_SUBMIT].u.wait,
-		      !atomic_read(&io[JQ_SUBMIT].pending_bios));
+	wait_for_completion_io(&io[JQ_SUBMIT].u.done);
 
 	/* handle synchronous decompress queue in the caller context */
 	z_erofs_decompress_queue(&io[JQ_SUBMIT], pagepool);
@@ -1439,6 +1485,15 @@ static int z_erofs_readpage(struct file *file, struct page *page)
 	struct page *pagepool = NULL;
 	int err;
 
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+	/* FIXME: Probe the page twice readpage! */
+	if (PageCont(page))
+		CHP_BUG_ON(TestSetPageContIODoing(page));
+
+	/* FIXME: Detected the endio bug twice! */
+	CHP_BUG_ON(ContPteHugePage(page) || PageContUptodate(page));
+#endif
+
 	trace_erofs_readpage(page, false);
 	f.headoffset = (erofs_off_t)page->index << PAGE_SHIFT;
 
@@ -1479,6 +1534,14 @@ static void z_erofs_readahead(struct readahead_control *rac)
 	trace_erofs_readpages(inode, readahead_index(rac), nr_pages, false);
 
 	while ((page = readahead_page(rac))) {
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+		/* FIXME: Probe the page twice readpage! */
+		if (PageCont(page))
+			CHP_BUG_ON(TestSetPageContIODoing(page));
+
+		/* FIXME: Detected the endio bug twice! */
+		CHP_BUG_ON(ContPteHugePage(page) || PageContUptodate(page));
+#endif
 		set_page_private(page, (unsigned long)head);
 		head = page;
 	}
